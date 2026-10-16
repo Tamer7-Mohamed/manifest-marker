@@ -106,6 +106,15 @@ def pick(ws, spans, a, b):
     return [w for w, (s, e) in zip(ws, spans) if s < b and e > a]
 
 
+def left_of(ws, cut):
+    """كلمات العمود الشمال، من غير 'BILL TOTALS' وما بعدها (لأنها بتيجي على نفس سطر NOTIFY)."""
+    L = [w for w in ws if float(w["x0"]) < cut - 1]
+    for i in range(len(L) - 1):
+        if L[i]["text"] == "BILL" and L[i + 1]["text"].startswith("TOTALS"):
+            return L[:i]
+    return L
+
+
 def digits(x):
     return re.sub(r"\D", "", x)
 
@@ -131,7 +140,7 @@ def run(data):
             body = lines[hi + 1:]
             for k, ws in enumerate(body):
                 ft, fsp = tspans(ws)
-                left = [w for w in ws if float(w["x0"]) < cut - 1]
+                left = left_of(ws, cut)
                 lt, lsp = tspans(left)
                 m = BL_RE.match(lt)
                 if m:
@@ -204,7 +213,7 @@ def run(data):
                 rest = [w for w, (s_, e_) in zip(left, lsp) if s_ >= m.end()]
                 if not rest:
                     for nxt in body[k + 1:k + 3]:
-                        nl = [w for w in nxt if float(w["x0"]) < cut - 1]
+                        nl = left_of(nxt, cut)
                         nt = " ".join(w["text"] for w in nl)
                         if nl and not STOP.match(nt):
                             rest = nl
