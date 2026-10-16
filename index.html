@@ -106,13 +106,25 @@ def pick(ws, spans, a, b):
     return [w for w, (s, e) in zip(ws, spans) if s < b and e > a]
 
 
-def left_of(ws, cut):
-    """كلمات العمود الشمال، من غير 'BILL TOTALS' وما بعدها (لأنها بتيجي على نفس سطر NOTIFY)."""
+JUNK = re.compile(r"^(\(\d{3}\)|N/M)$")
+
+
+def left_of(ws, cut, cw=6.0):
+    """نص عمود الأطراف بس (Shipper/Consignee/Notify):
+    - يقف عند 'BILL TOTALS'
+    - يقف عند أي فجوة كبيرة (النص اللي في عمود العلامات/الكمية زي (002) و N/M)
+    - يشيل (001) و N/M لو لزقوا في النص"""
     L = [w for w in ws if float(w["x0"]) < cut - 1]
     for i in range(len(L) - 1):
         if L[i]["text"] == "BILL" and L[i + 1]["text"].startswith("TOTALS"):
-            return L[:i]
-    return L
+            L = L[:i]
+            break
+    res = []
+    for w in L:
+        if res and float(w["x0"]) - float(res[-1]["x1"]) > 10 * cw:
+            break
+        res.append(w)
+    return [w for w in res if not JUNK.match(w["text"])]
 
 
 def digits(x):
@@ -126,7 +138,10 @@ def run(data):
     # ---- 1) قسّم السطور على البوالص ----
     with pdfplumber.open(io.BytesIO(bytes(data))) as pdf:
         for pno, page in enumerate(pdf.pages):
-            lines = build_lines(page.extract_words(x_tolerance=2, y_tolerance=2))
+            words = page.extract_words(x_tolerance=2, y_tolerance=2)
+            lines = build_lines(words)
+            cws = sorted((float(w["x1"]) - float(w["x0"])) / len(w["text"]) for w in words if len(w["text"]) >= 4)
+            cw = cws[len(cws) // 2] if cws else 6.0
             hi = None
             for i, ws in enumerate(lines):
                 t = " ".join(w["text"] for w in ws)
@@ -140,14 +155,14 @@ def run(data):
             body = lines[hi + 1:]
             for k, ws in enumerate(body):
                 ft, fsp = tspans(ws)
-                left = left_of(ws, cut)
+                left = left_of(ws, cut, cw)
                 lt, lsp = tspans(left)
                 m = BL_RE.match(lt)
                 if m:
                     cur = {"id": m.group(1), "lines": []}
                     bls.append(cur)
                 if cur is not None:
-                    cur["lines"].append({"pno": pno, "pw": pw, "ph": ph, "cut": cut, "body": body, "k": k,
+                    cur["lines"].append({"pno": pno, "pw": pw, "ph": ph, "cut": cut, "cw": cw, "body": body, "k": k,
                                          "ws": ws, "ft": ft, "fsp": fsp, "left": left, "lt": lt, "lsp": lsp})
 
     # ---- 2) لكل بوليصة: علّم كل عنصر مرة واحدة ----
@@ -212,8 +227,8 @@ def run(data):
                     continue
                 rest = [w for w, (s_, e_) in zip(left, lsp) if s_ >= m.end()]
                 if not rest:
-                    for nxt in body[k + 1:k + 3]:
-                        nl = left_of(nxt, cut)
+                    for nxt in body[k + 1:k + 4]:
+                        nl = left_of(nxt, cut, c["cw"])
                         nt = " ".join(w["text"] for w in nl)
                         if nl and not STOP.match(nt):
                             rest = nl
