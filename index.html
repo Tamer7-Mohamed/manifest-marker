@@ -25,7 +25,7 @@
   .note { color:var(--muted); font-size:.8rem; margin-top:16px; }
   .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:.82rem; margin-bottom:14px; }
   .legend span::before { content:""; display:inline-block; width:12px; height:12px; border-radius:3px; margin-inline-end:6px; vertical-align:-1px; }
-  .y::before { background:#ffe61a; } .g::before { background:#66d966; } .o::before { background:#ff9933; }
+  .y::before { background:#ffe61a; } .g::before { background:#66d966; } .o::before { background:#ff9933; } .r::before { background:#ff5959; }
   table { width:100%; border-collapse:collapse; margin-top:14px; font-size:.82rem; }
   th, td { border-bottom:1px solid var(--border); padding:6px 8px; text-align:start; }
   td.val { direction:ltr; text-align:left; word-break:break-all; }
@@ -42,6 +42,7 @@
       <span class="y">أول سطر: Shipper / Consignee / Notify</span>
       <span class="g">Shipper ID / Consignee ID / ACID</span>
       <span class="o">التوتال ووزنه</span>
+      <span class="r">Consignee ID مختلف عن أول 9 أرقام من ACID</span>
     </div>
     <div id="drop" class="disabled">
       <div id="dropText">جاري تجهيز البرنامج (أول مرة بياخد حوالي نص دقيقة)...</div>
@@ -70,7 +71,9 @@ ACID2 = re.compile(r"\b(\d{19})\b")
 TOT = re.compile(r"BILL TOTALS\s+(\d[\d,]*)")
 WGT = re.compile(r"([\d,]+\.\d+)\s*KGM\s*GROSS")
 
-YELLOW, GREEN, ORANGE = [1.0, 0.9, 0.1], [0.4, 0.85, 0.4], [1.0, 0.6, 0.2]
+BL_RE = re.compile(r"^\s*([A-Z0-9]{8,})\s+(BL|SWB)\b")
+
+YELLOW, GREEN, ORANGE, RED = [1.0, 0.9, 0.1], [0.4, 0.85, 0.4], [1.0, 0.6, 0.2], [1.0, 0.35, 0.35]
 
 
 def build_lines(words):
@@ -103,8 +106,15 @@ def pick(ws, spans, a, b):
     return [w for w, (s, e) in zip(ws, spans) if s < b and e > a]
 
 
+def digits(x):
+    return re.sub(r"\D", "", x)
+
+
 def run(data):
     out, found = [], []
+    bls, cur = [], None
+
+    # ---- 1) قسّم السطور على البوالص ----
     with pdfplumber.open(io.BytesIO(bytes(data))) as pdf:
         for pno, page in enumerate(pdf.pages):
             lines = build_lines(page.extract_words(x_tolerance=2, y_tolerance=2))
@@ -118,60 +128,104 @@ def run(data):
                 continue
             cut = next((float(w["x0"]) for w in lines[hi] if w["text"].startswith("QUANTITY")), float(page.width) / 2)
             pw, ph = float(page.width), float(page.height)
-
-            def add(ws, kind, color):
-                if not ws:
-                    return
-                out.append({
-                    "page": pno,
-                    "x0": min(float(w["x0"]) for w in ws), "x1": max(float(w["x1"]) for w in ws),
-                    "top": min(float(w["top"]) for w in ws), "bottom": max(float(w["bottom"]) for w in ws),
-                    "pw": pw, "ph": ph, "color": color,
-                })
-                found.append({"page": pno + 1, "kind": kind, "text": " ".join(w["text"] for w in ws)})
-
             body = lines[hi + 1:]
             for k, ws in enumerate(body):
-                full_t, full_sp = tspans(ws)
+                ft, fsp = tspans(ws)
                 left = [w for w in ws if float(w["x0"]) < cut - 1]
                 lt, lsp = tspans(left)
-
-                # أول سطر في Shipper / Consignee / Notify
-                for rx, kind in ((SHIP, "Shipper"), (CONS, "Consignee"), (NOTI, "Notify")):
-                    m = rx.match(lt)
-                    if not m:
-                        continue
-                    rest = [w for w, (s, e) in zip(left, lsp) if s >= m.end()]
-                    if not rest:
-                        for nxt in body[k + 1:k + 3]:
-                            nl = [w for w in nxt if float(w["x0"]) < cut - 1]
-                            nt = " ".join(w["text"] for w in nl)
-                            if nl and not STOP.match(nt):
-                                rest = nl
-                            if nl:
-                                break
-                    add(rest, kind, YELLOW)
-
-                # Shipper ID / Consignee ID
-                for rx, kind in ((SHIP_ID, "Shipper ID"), (CONS_ID, "Consignee ID")):
-                    for m in rx.finditer(full_t):
-                        add(pick(ws, full_sp, m.start(1), m.end(1)), kind, GREEN)
-
-                # ACID
-                m = ACID1.search(full_t) or ACID2.search(full_t)
+                m = BL_RE.match(lt)
                 if m:
-                    add(pick(ws, full_sp, m.start(1), m.end(1)), "ACID", GREEN)
+                    cur = {"id": m.group(1), "lines": []}
+                    bls.append(cur)
+                if cur is not None:
+                    cur["lines"].append({"pno": pno, "pw": pw, "ph": ph, "cut": cut, "body": body, "k": k,
+                                         "ws": ws, "ft": ft, "fsp": fsp, "left": left, "lt": lt, "lsp": lsp})
 
-                # التوتال + وزنه
-                m = TOT.search(full_t)
-                if m:
-                    add(pick(ws, full_sp, m.start(), m.end()), "Total", ORANGE)
-                    for nxt in body[k:k + 4]:
-                        nt, nsp = tspans(nxt)
-                        mw = WGT.search(nt)
-                        if mw:
-                            add(pick(nxt, nsp, mw.start(), mw.end()), "Total weight", ORANGE)
+    # ---- 2) لكل بوليصة: علّم كل عنصر مرة واحدة ----
+    for bl in bls:
+        L = bl["lines"]
+        seen = set()
+
+        def add(c, ws, kind, color, key=None):
+            key = key or kind
+            if not ws or key in seen:
+                return
+            seen.add(key)
+            out.append({
+                "page": c["pno"],
+                "x0": min(float(w["x0"]) for w in ws), "x1": max(float(w["x1"]) for w in ws),
+                "top": min(float(w["top"]) for w in ws), "bottom": max(float(w["bottom"]) for w in ws),
+                "pw": c["pw"], "ph": c["ph"], "color": color,
+            })
+            found.append({"page": c["pno"] + 1, "bl": bl["id"], "kind": kind,
+                          "text": " ".join(w["text"] for w in ws)})
+
+        # ACID (أول ظهور) + أول 9 أرقام منه
+        acid = None
+        for c in L:
+            m = ACID1.search(c["ft"]) or ACID2.search(c["ft"])
+            if m:
+                acid = m.group(1)
+                add(c, pick(c["ws"], c["fsp"], m.start(1), m.end(1)), "ACID", GREEN)
+                break
+        prefix = acid[:9] if acid else None
+
+        # Consignee ID: لازم يساوي أول 9 أرقام من الـ ACID (الاسم مش مهم)
+        labeled = [(c, m) for c in L for m in CONS_ID.finditer(c["ft"])]
+        target = None
+        if prefix:
+            for c, m in labeled:
+                if digits(m.group(1)) == prefix:
+                    target = (c, m.start(1), m.end(1))
+                    break
+            if target is None:
+                rx = re.compile(r"(?<!\d)" + prefix + r"(?!\d)")
+                for c in L:
+                    mm = rx.search(c["ft"])
+                    if mm:
+                        target = (c, mm.start(), mm.end())
+                        break
+        if target:
+            c, a0, b0 = target
+            add(c, pick(c["ws"], c["fsp"], a0, b0), "Consignee ID", GREEN)
+        elif labeled:
+            c, m = labeled[0]
+            add(c, pick(c["ws"], c["fsp"], m.start(1), m.end(1)), "Consignee ID (مختلف عن ACID)", RED, key="Consignee ID")
+
+        # باقي العناصر
+        for c in L:
+            ws, ft, fsp, left, lt, lsp, body, k, cut = (c["ws"], c["ft"], c["fsp"], c["left"], c["lt"],
+                                                        c["lsp"], c["body"], c["k"], c["cut"])
+            # أول سطر في Shipper / Consignee / Notify
+            for rx, kind in ((SHIP, "Shipper"), (CONS, "Consignee"), (NOTI, "Notify")):
+                m = rx.match(lt)
+                if not m:
+                    continue
+                rest = [w for w, (s_, e_) in zip(left, lsp) if s_ >= m.end()]
+                if not rest:
+                    for nxt in body[k + 1:k + 3]:
+                        nl = [w for w in nxt if float(w["x0"]) < cut - 1]
+                        nt = " ".join(w["text"] for w in nl)
+                        if nl and not STOP.match(nt):
+                            rest = nl
+                        if nl:
                             break
+                add(c, rest, kind, YELLOW)
+
+            # Shipper ID
+            for m in SHIP_ID.finditer(ft):
+                add(c, pick(ws, fsp, m.start(1), m.end(1)), "Shipper ID", GREEN)
+
+            # التوتال + وزنه
+            m = TOT.search(ft)
+            if m:
+                add(c, pick(ws, fsp, m.start(), m.end()), "Total", ORANGE)
+                for nxt in body[k:k + 4]:
+                    nt, nsp = tspans(nxt)
+                    mw = WGT.search(nt)
+                    if mw:
+                        add(c, pick(nxt, nsp, mw.start(), mw.end()), "Total weight", ORANGE)
+                        break
     return json.dumps({"rects": out, "found": found})
 
 
@@ -253,11 +307,12 @@ function renderTable(found) {
   wrap.textContent = "";
   const t = document.createElement("table");
   const head = t.createTHead().insertRow();
-  ["صفحة", "النوع", "النص اللي اتعلّم"].forEach(h => { const th = document.createElement("th"); th.textContent = h; head.appendChild(th); });
+  ["صفحة", "البوليصة", "النوع", "النص اللي اتعلّم"].forEach(h => { const th = document.createElement("th"); th.textContent = h; head.appendChild(th); });
   const tb = t.createTBody();
   found.forEach(f => {
     const r = tb.insertRow();
     r.insertCell().textContent = f.page;
+    const bc = r.insertCell(); bc.className = "val"; bc.textContent = f.bl;
     r.insertCell().textContent = f.kind;
     const c = r.insertCell(); c.className = "val"; c.textContent = f.text;
   });
