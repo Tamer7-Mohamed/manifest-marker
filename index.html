@@ -173,6 +173,38 @@ def run(data):
                             add(pick(nxt, nsp, mw.start(), mw.end()), "Total weight", ORANGE)
                             break
     return json.dumps({"rects": out, "found": found})
+
+
+def annotate(data, rects_json):
+    """طريقة بديلة: تعليم بـ Highlight annotations عن طريق pypdf."""
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import (DictionaryObject, NameObject, ArrayObject,
+                               FloatObject, NumberObject)
+    rects = json.loads(rects_json)
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(bytes(data))))
+    for r in rects:
+        pg = writer.pages[r["page"]]
+        mb = pg.mediabox
+        W, H = float(mb.width), float(mb.height)
+        sx, sy = W / r["pw"], H / r["ph"]
+        x0 = float(mb.left) + r["x0"] * sx - 1
+        x1 = float(mb.left) + r["x1"] * sx + 1
+        y1 = float(mb.top) - r["top"] * sy + 1
+        y0 = float(mb.top) - r["bottom"] * sy - 1
+        annot = DictionaryObject({
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/Highlight"),
+            NameObject("/Rect"): ArrayObject([FloatObject(v) for v in (x0, y0, x1, y1)]),
+            NameObject("/QuadPoints"): ArrayObject([FloatObject(v) for v in (x0, y1, x1, y1, x0, y0, x1, y0)]),
+            NameObject("/C"): ArrayObject([FloatObject(c) for c in r["color"]]),
+            NameObject("/CA"): FloatObject(0.5),
+            NameObject("/F"): NumberObject(4),
+        })
+        writer.add_annotation(page_number=r["page"], annotation=annot)
+    buf = io.BytesIO()
+    writer.write(buf)
+    from pyodide.ffi import to_js
+    return to_js(buf.getvalue())
 </script>
 
 <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
@@ -200,6 +232,10 @@ from unittest.mock import MagicMock
 for m in ["pypdfium2", "pypdfium2.raw", "pypdfium2._helpers", "pypdfium2._helpers.page", "pypdfium2._helpers.bitmap"]:
     sys.modules.setdefault(m, MagicMock())
 `);
+    try { await pyodide.runPythonAsync(`
+import micropip
+await micropip.install("pypdf")
+`); } catch (e) { console.warn("pypdf install failed", e); }
     step = "تشغيل الكود";
     await pyodide.runPythonAsync($("pycode").textContent);
     $("prog").style.display = "none";
@@ -243,28 +279,37 @@ async function handle(file) {
       throw new Error("ما لقيتش حاجة أعلّمها. اتأكد إن الـ PDF فيه نص حقيقي (مش صورة) وإنه نفس شكل المانيفست.");
     }
 
-    const { PDFDocument, rgb } = PDFLib;
-    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
-    const pages = doc.getPages();
-    const blend = PDFLib.BlendMode ? { blendMode: PDFLib.BlendMode.Multiply } : {};
-    for (const r of rects) {
-      const p = pages[r.page];
-      const { width: W, height: H } = p.getSize();
-      const sx = W / r.pw, sy = H / r.ph;
-      p.drawRectangle({
-        x: r.x0 * sx - 1,
-        y: H - r.bottom * sy - 1,
-        width: (r.x1 - r.x0) * sx + 2,
-        height: (r.bottom - r.top) * sy + 2,
-        color: rgb(r.color[0], r.color[1], r.color[2]),
-        opacity: 0.45,
-        ...blend,
-      });
+    let out, method = "pdf-lib";
+    try {
+      const { PDFDocument, rgb } = PDFLib;
+      const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      const pages = doc.getPages();
+      const blend = PDFLib.BlendMode ? { blendMode: PDFLib.BlendMode.Multiply } : {};
+      for (const r of rects) {
+        const p = pages[r.page];
+        const { width: W, height: H } = p.getSize();
+        const sx = W / r.pw, sy = H / r.ph;
+        p.drawRectangle({
+          x: r.x0 * sx - 1,
+          y: H - r.bottom * sy - 1,
+          width: (r.x1 - r.x0) * sx + 2,
+          height: (r.bottom - r.top) * sy + 2,
+          color: rgb(r.color[0], r.color[1], r.color[2]),
+          opacity: 0.45,
+          ...blend,
+        });
+      }
+      out = await doc.save();
+    } catch (e1) {
+      console.warn("pdf-lib failed, falling back to pypdf:", e1);
+      method = "pypdf";
+      pyodide.globals.set("rects_json", JSON.stringify(rects));
+      const res = await pyodide.runPythonAsync("annotate(pdf_data.to_py(), rects_json)");
+      out = res;
     }
-    const out = await doc.save();
     const url = URL.createObjectURL(new Blob([out], { type: "application/pdf" }));
     const name = file.name.replace(/\.pdf$/i, "") + "_marked.pdf";
-    status(`تم تعليم ${found.length} عنصر`, "ok");
+    status(`تم تعليم ${found.length} عنصر` + (method === "pypdf" ? " (بالطريقة البديلة: Highlight)" : ""), "ok");
     const a = document.createElement("a");
     a.href = url; a.download = name;
     const b = document.createElement("button");
