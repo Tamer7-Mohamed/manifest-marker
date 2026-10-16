@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>تعليم المانيفست (PDF)</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c1f24; --muted:#6b7280; --accent:#2563eb; --border:#d9dde3; --ok:#15803d; --err:#b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --card:#1d2025; --text:#e8eaed; --muted:#9aa3af; --accent:#5b8def; --border:#343a43; --ok:#4ade80; --err:#f87171; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,"Segoe UI",Tahoma,sans-serif; display:flex; justify-content:center; padding:32px 16px; }
+  main { width:100%; max-width:620px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 20px; font-size:.9rem; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; }
+  #drop { border:2px dashed var(--border); border-radius:10px; padding:36px 16px; text-align:center; cursor:pointer; transition:.15s; }
+  #drop.over, #drop:hover { border-color:var(--accent); }
+  #drop.disabled { opacity:.5; pointer-events:none; }
+  #status { margin-top:16px; font-size:.92rem; min-height:1.4em; white-space:pre-wrap; }
+  .ok { color:var(--ok); } .err { color:var(--err); direction:ltr; text-align:left; font-size:.8rem; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:1rem; cursor:pointer; margin-top:12px; }
+  progress { width:100%; margin-top:10px; }
+  .note { color:var(--muted); font-size:.8rem; margin-top:16px; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:.82rem; margin-bottom:14px; }
+  .legend span::before { content:""; display:inline-block; width:12px; height:12px; border-radius:3px; margin-inline-end:6px; vertical-align:-1px; }
+  .y::before { background:#ffe61a; } .g::before { background:#66d966; } .o::before { background:#ff9933; }
+  table { width:100%; border-collapse:collapse; margin-top:14px; font-size:.82rem; }
+  th, td { border-bottom:1px solid var(--border); padding:6px 8px; text-align:start; }
+  td.val { direction:ltr; text-align:left; word-break:break-all; }
+  #resWrap { max-height:320px; overflow:auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🖍️ تعليم المانيفست (PDF → PDF)</h1>
+  <p class="sub">كل المعالجة بتتم في المتصفح عندك، والملف ما بيترفعش على أي سيرفر.</p>
+
+  <div class="card">
+    <div class="legend">
+      <span class="y">أول سطر: Shipper / Consignee / Notify</span>
+      <span class="g">Shipper ID / Consignee ID / ACID</span>
+      <span class="o">التوتال ووزنه</span>
+    </div>
+    <div id="drop" class="disabled">
+      <div id="dropText">جاري تجهيز البرنامج (أول مرة بياخد حوالي نص دقيقة)...</div>
+      <input id="file" type="file" accept="application/pdf" hidden>
+    </div>
+    <progress id="prog" style="display:none"></progress>
+    <div id="status"></div>
+    <div id="dl"></div>
+    <div id="resWrap"></div>
+  </div>
+  <p class="note">لازم الـ PDF يكون فيه نص حقيقي (مش صورة ممسوحة).</p>
+</main>
+
+<script type="text/x-python" id="pycode">
+import io, re, json
+import pdfplumber
+
+SHIP = re.compile(r"^\s*SHIPPER(?!\s*ID)\s*:?\s*")
+CONS = re.compile(r"^\s*CONSIGNEE(?!\s*(?:VAT|ID|TAX))\s*:?\s*")
+NOTI = re.compile(r"^\s*NOTIFY PARTY 1\s*:?\s*")
+STOP = re.compile(r"^\s*(SHIPPER|CONSIGNEE|NOTIFY|PLACE OF)")
+SHIP_ID = re.compile(r"SHIPPER\s*ID\s*:\s*(\S+)")
+CONS_ID = re.compile(r"CONSIGNEE\s*(?:VAT|ID|TAX\s*ID)\s*:\s*(\S+)")
+ACID1 = re.compile(r"ACID\D{0,12}(\d{10,})", re.I)
+ACID2 = re.compile(r"\b(\d{19})\b")
+TOT = re.compile(r"BILL TOTALS\s+(\d[\d,]*)")
+WGT = re.compile(r"([\d,]+\.\d+)\s*KGM\s*GROSS")
+
+YELLOW, GREEN, ORANGE = [1.0, 0.9, 0.1], [0.4, 0.85, 0.4], [1.0, 0.6, 0.2]
+
+
+def build_lines(words):
+    words = sorted(words, key=lambda w: (float(w["top"]), float(w["x0"])))
+    lines, cur, ref = [], [], 0.0
+    for w in words:
+        if cur and abs(float(w["top"]) - ref) > 3:
+            lines.append(sorted(cur, key=lambda x: float(x["x0"])))
+            cur = []
+        if not cur:
+            ref = float(w["top"])
+        cur.append(w)
+    if cur:
+        lines.append(sorted(cur, key=lambda x: float(x["x0"])))
+    return lines
+
+
+def tspans(ws):
+    txt, spans = "", []
+    for w in ws:
+        if txt:
+            txt += " "
+        s = len(txt)
+        txt += w["text"]
+        spans.append((s, len(txt)))
+    return txt, spans
+
+
+def pick(ws, spans, a, b):
+    return [w for w, (s, e) in zip(ws, spans) if s < b and e > a]
+
+
+def run(data):
+    out, found = [], []
+    with pdfplumber.open(io.BytesIO(bytes(data))) as pdf:
+        for pno, page in enumerate(pdf.pages):
+            lines = build_lines(page.extract_words(x_tolerance=2, y_tolerance=2))
+            hi = None
+            for i, ws in enumerate(lines):
+                t = " ".join(w["text"] for w in ws)
+                if "MARKS" in t and "QUANTITY" in t:
+                    hi = i
+                    break
+            if hi is None:
+                continue
+            cut = next((float(w["x0"]) for w in lines[hi] if w["text"].startswith("QUANTITY")), float(page.width) / 2)
+            pw, ph = float(page.width), float(page.height)
+
+            def add(ws, kind, color):
+                if not ws:
+                    return
+                out.append({
+                    "page": pno,
+                    "x0": min(float(w["x0"]) for w in ws), "x1": max(float(w["x1"]) for w in ws),
+                    "top": min(float(w["top"]) for w in ws), "bottom": max(float(w["bottom"]) for w in ws),
+                    "pw": pw, "ph": ph, "color": color,
+                })
+                found.append({"page": pno + 1, "kind": kind, "text": " ".join(w["text"] for w in ws)})
+
+            body = lines[hi + 1:]
+            for k, ws in enumerate(body):
+                full_t, full_sp = tspans(ws)
+                left = [w for w in ws if float(w["x0"]) < cut - 1]
+                lt, lsp = tspans(left)
+
+                # أول سطر في Shipper / Consignee / Notify
+                for rx, kind in ((SHIP, "Shipper"), (CONS, "Consignee"), (NOTI, "Notify")):
+                    m = rx.match(lt)
+                    if not m:
+                        continue
+                    rest = [w for w, (s, e) in zip(left, lsp) if s >= m.end()]
+                    if not rest:
+                        for nxt in body[k + 1:k + 3]:
+                            nl = [w for w in nxt if float(w["x0"]) < cut - 1]
+                            nt = " ".join(w["text"] for w in nl)
+                            if nl and not STOP.match(nt):
+                                rest = nl
+                            if nl:
+                                break
+                    add(rest, kind, YELLOW)
+
+                # Shipper ID / Consignee ID
+                for rx, kind in ((SHIP_ID, "Shipper ID"), (CONS_ID, "Consignee ID")):
+                    for m in rx.finditer(full_t):
+                        add(pick(ws, full_sp, m.start(1), m.end(1)), kind, GREEN)
+
+                # ACID
+                m = ACID1.search(full_t) or ACID2.search(full_t)
+                if m:
+                    add(pick(ws, full_sp, m.start(1), m.end(1)), "ACID", GREEN)
+
+                # التوتال + وزنه
+                m = TOT.search(full_t)
+                if m:
+                    add(pick(ws, full_sp, m.start(), m.end()), "Total", ORANGE)
+                    for nxt in body[k:k + 4]:
+                        nt, nsp = tspans(nxt)
+                        mw = WGT.search(nt)
+                        if mw:
+                            add(pick(nxt, nsp, mw.start(), mw.end()), "Total weight", ORANGE)
+                            break
+    return json.dumps({"rects": out, "found": found})
+</script>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const status = (msg, cls="") => { $("status").className = cls; $("status").textContent = msg; };
+let pyodide = null;
+let step = "";
+
+async function init() {
+  try {
+    $("prog").style.display = "block";
+    step = "تحميل Pyodide";
+    pyodide = await loadPyodide();
+    status("بحمّل المكتبات...");
+    step = "تحميل pillow / cryptography";
+    await pyodide.loadPackage(["micropip", "pillow", "cryptography"]);
+    step = "تثبيت pdfplumber من PyPI";
+    await pyodide.runPythonAsync(`
+import micropip
+await micropip.install(["charset-normalizer", "pdfminer.six", "pdfplumber"], deps=False)
+import sys
+from unittest.mock import MagicMock
+for m in ["pypdfium2", "pypdfium2.raw", "pypdfium2._helpers", "pypdfium2._helpers.page", "pypdfium2._helpers.bitmap"]:
+    sys.modules.setdefault(m, MagicMock())
+`);
+    step = "تشغيل الكود";
+    await pyodide.runPythonAsync($("pycode").textContent);
+    $("prog").style.display = "none";
+    $("drop").classList.remove("disabled");
+    $("dropText").textContent = "اضغط هنا أو اسحب ملف الـ PDF";
+    status("");
+  } catch (e) {
+    $("prog").style.display = "none";
+    status("فشل في خطوة: " + step + "\n" + e, "err");
+  }
+}
+
+function renderTable(found) {
+  const wrap = $("resWrap");
+  wrap.textContent = "";
+  const t = document.createElement("table");
+  const head = t.createTHead().insertRow();
+  ["صفحة", "النوع", "النص اللي اتعلّم"].forEach(h => { const th = document.createElement("th"); th.textContent = h; head.appendChild(th); });
+  const tb = t.createTBody();
+  found.forEach(f => {
+    const r = tb.insertRow();
+    r.insertCell().textContent = f.page;
+    r.insertCell().textContent = f.kind;
+    const c = r.insertCell(); c.className = "val"; c.textContent = f.text;
+  });
+  wrap.appendChild(t);
+}
+
+async function handle(file) {
+  if (!file || !pyodide) return;
+  $("dl").textContent = ""; $("resWrap").textContent = "";
+  $("drop").classList.add("disabled");
+  $("prog").style.display = "block";
+  status("جاري التعليم: " + file.name);
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    pyodide.globals.set("pdf_data", bytes);
+    const json = await pyodide.runPythonAsync("run(pdf_data.to_py())");
+    const { rects, found } = JSON.parse(json);
+    if (!rects.length) {
+      throw new Error("ما لقيتش حاجة أعلّمها. اتأكد إن الـ PDF فيه نص حقيقي (مش صورة) وإنه نفس شكل المانيفست.");
+    }
+
+    const { PDFDocument, rgb } = PDFLib;
+    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const pages = doc.getPages();
+    const blend = PDFLib.BlendMode ? { blendMode: PDFLib.BlendMode.Multiply } : {};
+    for (const r of rects) {
+      const p = pages[r.page];
+      const { width: W, height: H } = p.getSize();
+      const sx = W / r.pw, sy = H / r.ph;
+      p.drawRectangle({
+        x: r.x0 * sx - 1,
+        y: H - r.bottom * sy - 1,
+        width: (r.x1 - r.x0) * sx + 2,
+        height: (r.bottom - r.top) * sy + 2,
+        color: rgb(r.color[0], r.color[1], r.color[2]),
+        opacity: 0.45,
+        ...blend,
+      });
+    }
+    const out = await doc.save();
+    const url = URL.createObjectURL(new Blob([out], { type: "application/pdf" }));
+    const name = file.name.replace(/\.pdf$/i, "") + "_marked.pdf";
+    status(`تم تعليم ${found.length} عنصر`, "ok");
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    const b = document.createElement("button");
+    b.textContent = "⬇️ تحميل " + name;
+    a.appendChild(b);
+    $("dl").appendChild(a);
+    renderTable(found);
+  } catch (e) {
+    status(String(e), "err");
+  } finally {
+    $("prog").style.display = "none";
+    $("drop").classList.remove("disabled");
+  }
+}
+
+const drop = $("drop"), input = $("file");
+drop.addEventListener("click", () => input.click());
+input.addEventListener("change", () => handle(input.files[0]));
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); handle(e.dataTransfer.files[0]); });
+
+init();
+</script>
+</body>
+</html>
