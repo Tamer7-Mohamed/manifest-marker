@@ -65,7 +65,7 @@ CONS = re.compile(r"^\s*CONSIGNEE(?!\s*(?:VAT|ID|TAX))\s*:?\s*")
 NOTI = re.compile(r"^\s*NOTIFY PARTY 1\s*:?\s*")
 STOP = re.compile(r"^\s*(SHIPPER|CONSIGNEE|NOTIFY|PLACE OF)")
 SHIP_ID = re.compile(r"SHIPPER\s*ID\s*:\s*(\S+)")
-CONS_ID = re.compile(r"CONSIGNEE\s*(?:VAT|ID|TAX\s*ID)\s*:\s*(\S+)")
+CONS_ID = re.compile(r"(?:CONSIGNEE|IMPORTER)\s*(?:VAT|TAX\s*ID|ID)\s*:\s*(\S+)")
 ACID1 = re.compile(r"ACID\D{0,12}(\d{10,})", re.I)
 ACID2 = re.compile(r"\b(\d{19})\b")
 TOT = re.compile(r"BILL TOTALS\s+(\d[\d,]*)")
@@ -188,7 +188,7 @@ def run(data):
                     target = (c, m.start(1), m.end(1))
                     break
             if target is None:
-                rx = re.compile(r"(?<!\d)" + prefix + r"(?!\d)")
+                rx = re.compile(r"(?<!\d)" + r"[-\s./]?".join(prefix) + r"(?!\d)")
                 for c in L:
                     mm = rx.search(c["ft"])
                     if mm:
